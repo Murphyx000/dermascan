@@ -13,13 +13,13 @@
     "bcc",
     "mel"
   ],
-  "threshold_moderate": 0.186,
-  "threshold_high": 0.557,
+  "threshold_moderate": 0.5760000000000001,
+  "threshold_high": 0.65,
   "metrics": {
-    "n_test": 1477,
-    "auc": 0.8990029478064853,
-    "sensitivity": 0.9006849315068494,
-    "specificity": 0.6953586497890295,
-    "test_set": "de validación HAM10000 (modelo provisional)"
+    "n_test": 321,
+    "auc": 0.9488510826336721,
+    "sensitivity": 0.9233870967741935,
+    "specificity": 0.863013698630137,
+    "test_set": "PAD-UFES-20 (fotos de smartphone)"
   }
 }

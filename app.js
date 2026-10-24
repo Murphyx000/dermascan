@@ -159,6 +159,8 @@ function checkQuality() {
     if (mean < 60) msgs.push("La foto está muy oscura; busca más luz.");
     if (mean > 225) msgs.push("La foto está sobreexpuesta; evita el flash o la luz directa.");
     if (lapVar < 25) msgs.push("La foto parece desenfocada; vuelve a tomarla esperando el enfoque.");
+    const det = detectLesion(cropped(128).getContext("2d").getImageData(0, 0, 128, 128));
+    if (!det.found && det.reason !== "dark") msgs.push(DETECT_MSG[det.reason] + ".");
     $("quality").hidden = !msgs.length;
     $("quality").textContent = msgs.join(" ");
   }, 120);
@@ -187,6 +189,7 @@ async function analyze() {
     const risk = cfg.malignant_classes.reduce((s, k) => s + probs[cfg.classes.indexOf(k)], 0);
     const level = risk >= cfg.threshold_high ? "high" : risk >= cfg.threshold_moderate ? "mid" : "low";
     const thumb = cropped(112).toDataURL("image/jpeg", 0.8);
+    $("detNote").hidden = detectLesion(cropped(128).getContext("2d").getImageData(0, 0, 128, 128)).found;
     renderResult({ probs, risk, level, thumb, date: Date.now() });
     saveHistory({ risk, level, thumb, date: Date.now(), top: cfg.classes[probs.indexOf(Math.max(...probs))] });
   } catch (e) { fail(e); } finally { busy(null); }
@@ -258,8 +261,16 @@ setupPan();
 // ---------- cámara en vivo (getUserMedia) ----------
 // Solo en una web propia con HTTPS. Dentro de un marco (p. ej. claude.ai) el navegador la bloquea,
 // así que "Tomar foto" abre directamente la cámara del sistema mediante el <input capture>.
-let stream = null;
+// Mientras apuntas: detección del lunar (detect.js), medidor de nitidez, linterna, zoom y tocar para enfocar.
+// Al capturar se usa el fotograma más nítido del último 1,5 s, no el del instante del toque.
+let stream = null, track = null, caps = {}, loopTimer = null, best = null, torchOn = false;
 const liveCamera = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && window.top === window && isSecureContext;
+const small = document.createElement("canvas");
+small.width = small.height = 128;
+const smallCtx = small.getContext("2d", { willReadFrequently: true });
+const SHARP_OK = 25, BEST_MS = 1500;
+
+const applyCam = (c) => track && track.applyConstraints({ advanced: [c] }).catch(() => {});
 
 async function startCamera() {
   $("errBox").hidden = true;
@@ -272,22 +283,100 @@ async function startCamera() {
     return;
   }
   $("camDenied").hidden = true;
+  track = stream.getVideoTracks()[0];
+  caps = (track.getCapabilities && track.getCapabilities()) || {};
+  if ((caps.focusMode || []).includes("continuous")) applyCam({ focusMode: "continuous" });
+  torchOn = false;
+  $("btnTorch").hidden = !caps.torch;
+  $("btnTorch").setAttribute("aria-pressed", "false");
+  $("camZoomRow").hidden = !caps.zoom;
+  if (caps.zoom) {
+    const z = $("camZoom"), start = Math.min(caps.zoom.max, Math.max(caps.zoom.min, 2));
+    z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1; z.value = start;
+    setCamZoom(start);
+  }
+  best = null;
   $("video").srcObject = stream;
   show("vCamera");
   $("video").play().catch(() => {});
+  loop();
   loadModel().catch(fail);
 }
+
 function stopCamera() {
+  clearTimeout(loopTimer);
   if (stream) stream.getTracks().forEach((t) => t.stop());
-  stream = null;
+  stream = track = null;
+  best = null;
   $("video").srcObject = null;
 }
+
+// análisis en vivo ~7 veces por segundo sobre el cuadrado central (lo que se ve en pantalla)
+function loop() {
+  const v = $("video");
+  if (!stream) return;
+  if (v.videoWidth) {
+    const s = Math.min(v.videoWidth, v.videoHeight);
+    smallCtx.drawImage(v, (v.videoWidth - s) / 2, (v.videoHeight - s) / 2, s, s, 0, 0, 128, 128);
+    const id = smallCtx.getImageData(0, 0, 128, 128);
+    const det = detectLesion(id), sh = sharpness(id), sharp = sh >= SHARP_OK;
+    drawOutline($("camOverlay"), det, det.found ? "#4ade80" : "#fbbf24");
+    $("camRing").classList.toggle("ok", det.found && sharp);
+    $("camStatus").textContent = !det.found ? DETECT_MSG[det.reason]
+      : sharp ? "Lunar detectado y enfocado: pulsa Capturar" : "Lunar detectado: mantén el teléfono quieto para enfocar";
+    $("camStatus").className = "cam-status" + (det.found && sharp ? " ok" : "");
+    $("sharpFill").style.width = Math.min(100, (sh / (SHARP_OK * 3)) * 100) + "%";
+    $("sharpFill").classList.toggle("ok", sharp);
+    // guarda el mejor fotograma reciente (nitidez, con prioridad si hay lunar detectado)
+    const score = sh * (det.found ? 2 : 1), now = performance.now();
+    if (!best || now - best.t > BEST_MS || score >= best.score) {
+      const k = Math.min(1, 1600 / Math.max(v.videoWidth, v.videoHeight));
+      const c = (best && best.canvas) || document.createElement("canvas");
+      c.width = Math.round(v.videoWidth * k); c.height = Math.round(v.videoHeight * k);
+      c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+      best = { canvas: c, score, t: now };
+    }
+  }
+  loopTimer = setTimeout(loop, 140);
+}
+
 function snap() {
   const v = $("video");
   if (!v.videoWidth) return;
-  openFrame(v, v.videoWidth, v.videoHeight);
+  if (best && performance.now() - best.t <= BEST_MS) {
+    const c = best.canvas;
+    best = null;              // el canvas pasa a la pantalla de encuadre; no se reutiliza
+    openFrame(c, c.width, c.height);
+  } else openFrame(v, v.videoWidth, v.videoHeight);
   stopCamera();
 }
+
+function setCamZoom(z) {
+  applyCam({ zoom: +z });
+  $("camZoomVal").textContent = (+z).toFixed(1).replace(".0", "") + "×";
+}
+
+// tocar para enfocar: punto de interés donde el navegador lo permite; siempre muestra el indicador
+$("camBox").addEventListener("click", (e) => {
+  if (e.target.closest("button")) return;
+  const r = $("camBox").getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+  const dot = $("focusDot");
+  dot.style.left = x * 100 + "%"; dot.style.top = y * 100 + "%";
+  dot.hidden = false; dot.classList.remove("pulse"); void dot.offsetWidth; dot.classList.add("pulse");
+  setTimeout(() => (dot.hidden = true), 900);
+  const modes = caps.focusMode || [];
+  if (modes.includes("single-shot") || caps.pointsOfInterest) {
+    applyCam({ focusMode: modes.includes("single-shot") ? "single-shot" : undefined, pointsOfInterest: [{ x, y }] });
+    if (modes.includes("continuous")) setTimeout(() => applyCam({ focusMode: "continuous" }), 1500);
+  }
+  best = null;                // tras enfocar se descartan los fotogramas anteriores
+});
+$("btnTorch").addEventListener("click", () => {
+  torchOn = !torchOn;
+  applyCam({ torch: torchOn });
+  $("btnTorch").setAttribute("aria-pressed", String(torchOn));
+});
+$("camZoom").addEventListener("input", (e) => setCamZoom(e.target.value));
 $("btnCamera").addEventListener("click", (e) => {
   if (!liveCamera) return;      // sin cámara en vivo: la etiqueta abre el <input capture>
   e.preventDefault();
