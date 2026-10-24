@@ -88,9 +88,14 @@
     <p class="muted">Arrastra para mover y usa el control para acercar. El lunar debe quedar dentro del círculo.</p>
     <div id="cropBox" class="crop">
       <canvas id="cropCanvas" width="600" height="600"></canvas>
+      <canvas id="cropOverlay" class="overlay" width="600" height="600" aria-hidden="true"></canvas>
       <div class="ring" aria-hidden="true"></div>
     </div>
     <input id="zoom" type="range" min="1" max="6" step="0.01" value="1" aria-label="Zoom">
+    <div id="candBox" class="cands" hidden>
+      <p id="candText" class="muted"></p>
+      <div id="candChips" class="chips"></div>
+    </div>
     <div id="quality" class="quality" hidden></div>
     <div class="row">
       <button id="btnBack" class="btn">Volver</button>

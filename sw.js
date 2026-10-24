@@ -1,9 +1,9 @@
 // Cache offline: tras la primera visita la app funciona sin conexión.
-const CACHE = "dermascan-v3";
+const CACHE = "dermascan-v4";
 const FILES = [
   "./", "index.html", "style.css", "app.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png",
   "vendor/ort.min.js", "vendor/ort-wasm-simd-threaded.wasm", "vendor/ort-wasm-simd-threaded.mjs", "vendor/qrcode.min.js", "detect.js",
-  "model/model.onnx", "model/config.json", "examples/nev.jpg", "examples/bcc.jpg", "examples/mel.jpg",
+  "model/model.onnx", "model/det.onnx", "model/config.json", "examples/nev.jpg", "examples/bcc.jpg", "examples/mel.jpg",
 ];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));

@@ -9,7 +9,10 @@
 // umbrales elegidos en validación (ml/out/detector_metrics.json); maskT y selR fijan cómo se forma la máscara
 const DETECT = { minArea: 0.008, maxArea: 0.7, minContrast: 22, minSkin: 0.35, centerR: 0.30, maskT: 9.8, selR: 0.36 };
 
-function detectLesion(imgData) {
+// segmentación común: devuelve la máscara de manchas oscuras, sus componentes conexas y la piel de referencia
+// opts.hyst: umbral doble con histéresis (las manchas que superan el umbral estricto se expanden mientras
+// superen hyst·T), para recuperar la lesión completa y no solo su núcleo más oscuro
+function segment(imgData, opts = {}) {
   const { data, width: W, height: H } = imgData, N = W * H;
   const L = new Float32Array(N), skin = new Uint8Array(N);
   for (let i = 0; i < N; i++) {
@@ -29,7 +32,7 @@ function detectLesion(imgData) {
     S[y * W + x] = s / n;
   }
   const meanL = S.reduce((acc, v) => acc + v, 0) / N;
-  if (meanL < 35) return { found: false, reason: "dark", meanL };
+  if (meanL < 35) return { dark: true, meanL };
 
   // modelo de iluminación: plano L = a + b·x + c·y ajustado a la piel del borde (banda exterior del 14 %).
   // Se descarta el 35 % más oscuro del borde por si el lunar lo toca.
@@ -73,6 +76,19 @@ function detectLesion(imgData) {
     return o;
   };
   mask = morph(morph(morph(morph(mask, true), true), false), false);
+  if (opts.hyst) {
+    const low = new Uint8Array(N), st = [];
+    for (let i = 0; i < N; i++) low[i] = Rz[i] < -T * opts.hyst ? 1 : 0;
+    for (let i = 0; i < N; i++) if (mask[i]) st.push(i);
+    while (st.length) {
+      const p = st.pop(), x = p % W, y = (p / W) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const xx = x + dx, yy = y + dy, q = yy * W + xx;
+        if (xx >= 0 && yy >= 0 && xx < W && yy < H && low[q] && !mask[q]) { mask[q] = 1; st.push(q); }
+      }
+    }
+    mask = morph(morph(mask, true), false);
+  }
 
   // componentes conexas: se elige la de mayor área ponderada por cercanía al centro
   const lab = new Int32Array(N).fill(-1), comps = [], stack = new Int32Array(N);
@@ -97,14 +113,23 @@ function detectLesion(imgData) {
     const mx = sx / area, my = sy / area, dist = Math.hypot(mx - cx, my - cy);
     comps.push({ id, area, mx, my, dist, perim, touchesEdge, score: area * Math.max(0, 1 - dist / (R * 1.6)) });
   }
+  let refSkin = 0;
+  for (const i of ref) refSkin += skin[i];
+  return { W, H, N, Rz, lab, comps, refMean: rs / ref.length, skinFrac: refSkin / ref.length, meanL, Rc };
+}
+
+// ¿hay un lunar en el centro? (versión evaluada en la tesis: ml/out/detector_metrics.json)
+function detectLesion(imgData) {
+  const g = segment(imgData);
+  if (g.dark) return { found: false, reason: "dark", meanL: g.meanL };
+  const { W, H, N, Rz, lab, comps, meanL, Rc } = g;
   if (!comps.length) return { found: false, reason: "none", meanL };
   const c = comps.reduce((a, b) => (b.score > a.score ? b : a));
   const sel = new Uint8Array(N);
-  let inR = 0, refSkin = 0;
+  let inR = 0;
   for (let i = 0; i < N; i++) if (lab[i] === c.id) { sel[i] = 1; inR += Rz[i]; }
-  for (const i of ref) refSkin += skin[i];
-  const areaFrac = c.area / N, contrast = rs / ref.length - inR / c.area;
-  const skinFrac = refSkin / ref.length, compact = (4 * Math.PI * c.area) / (c.perim * c.perim);
+  const areaFrac = c.area / N, contrast = g.refMean - inR / c.area;
+  const skinFrac = g.skinFrac, compact = (4 * Math.PI * c.area) / (c.perim * c.perim);
   let reason = "ok";
   if (skinFrac < DETECT.minSkin) reason = "no_skin";
   else if (c.score <= 0 || c.dist > Rc) reason = "off_center";
@@ -113,6 +138,96 @@ function detectLesion(imgData) {
   else if (contrast < DETECT.minContrast) reason = "low_contrast";
   return { found: reason === "ok", reason, mask: sel, areaFrac, contrast, skinFrac, compact, meanL,
            cx: c.mx / W, cy: c.my / H };
+}
+
+// todas las manchas candidatas de la imagen (para fotos con varios lunares). Cada candidato trae su
+// centro, tamaño y contorno en coordenadas normalizadas [0, 1]; luego la red neuronal confirma cuáles son lunares.
+function findCandidates(imgData, opts = {}) {
+  // primero con histéresis (contorno completo); las manchas que así quedan irregulares se recuperan
+  // con su núcleo estricto (sin histéresis), siempre que no estén ya cubiertas por otro candidato
+  const full = candidatesFrom(imgData, opts, opts.hyst ?? 0.8);
+  const core = candidatesFrom(imgData, opts, 0);
+  const inside = (k, c) => Math.abs(k.cx - c.cx) < c.w / 2 && Math.abs(k.cy - c.cy) < c.h / 2;
+  return full.concat(core.filter((k) => !full.some((c) => inside(k, c))))
+    .sort((p, q) => q.areaFrac * q.contrast - p.areaFrac * p.contrast)
+    .slice(0, opts.max ?? 8);
+}
+
+function candidatesFrom(imgData, opts, hyst) {
+  const minArea = opts.minArea ?? 0.0015, maxArea = opts.maxArea ?? DETECT.maxArea;
+  const minContrast = opts.minContrast ?? DETECT.minContrast * 0.8;
+  const g = segment(imgData, { hyst });
+  if (g.dark || g.skinFrac < DETECT.minSkin) return [];
+  const { W, H, N, Rz, lab } = g;
+  const acc = g.comps.map(() => ({ sum: 0, x0: W, y0: H, x1: 0, y1: 0, edge: [] }));
+  for (let i = 0; i < N; i++) {
+    const id = lab[i];
+    if (id < 0) continue;
+    const a = acc[id], x = i % W, y = (i / W) | 0;
+    a.sum += Rz[i];
+    if (x < a.x0) a.x0 = x; if (x > a.x1) a.x1 = x; if (y < a.y0) a.y0 = y; if (y > a.y1) a.y1 = y;
+    if (x === 0 || y === 0 || x === W - 1 || y === H - 1 || lab[i - 1] !== id || lab[i + 1] !== id || lab[i - W] !== id || lab[i + W] !== id)
+      a.edge.push(x / W, y / H);
+  }
+  return g.comps.map((c, k) => ({ c, a: acc[k] }))
+    .map(({ c, a }) => ({ cx: c.mx / W, cy: c.my / H, areaFrac: c.area / N, contrast: g.refMean - a.sum / c.area,
+                          w: (a.x1 - a.x0 + 1) / W, h: (a.y1 - a.y0 + 1) / H, edge: a.edge, px: 1 / W,
+                          touchesEdge: c.touchesEdge, compact: (4 * Math.PI * c.area) / (c.perim * c.perim) }))
+    // descarta lo que toca el borde (sombras, o un lunar cortado que no se puede analizar) y las formas tipo telaraña
+    .filter((k) => k.areaFrac >= minArea && k.areaFrac <= maxArea && k.contrast >= minContrast &&
+                   !k.touchesEdge && k.compact >= (opts.minCompact ?? 0.1));
+}
+
+// localiza los lunares de una foto: propuestas (findCandidates) confirmadas por la red (probFn sobre un
+// recorte de 128 px) y, además, el recorte central, porque el usuario encuadra el lunar en el centro.
+// Si el centro es un lunar y ninguna propuesta lo cubre, se añade con el contorno de detectLesion.
+async function locateLesions(source, w, h, probFn, thr) {
+  const k = Math.min(1, 320 / Math.max(w, h)), t = document.createElement("canvas");
+  t.width = Math.round(w * k); t.height = Math.round(h * k);
+  const tx = t.getContext("2d", { willReadFrequently: true });
+  tx.drawImage(source, 0, 0, t.width, t.height);
+  const c128 = document.createElement("canvas");
+  c128.width = c128.height = 128;
+  const x128 = c128.getContext("2d", { willReadFrequently: true });
+  const out = [];
+  for (const c of findCandidates(tx.getImageData(0, 0, t.width, t.height))) {
+    const side = Math.max(48, Math.max(c.w * w, c.h * h) * 2);
+    const x0 = Math.min(Math.max(c.cx * w - side / 2, 0), Math.max(0, w - side));
+    const y0 = Math.min(Math.max(c.cy * h - side / 2, 0), Math.max(0, h - side));
+    x128.drawImage(source, x0, y0, side, side, 0, 0, 128, 128);
+    c.p = await probFn(c128);
+    if (c.p >= thr) out.push(c);
+  }
+  // recorte central (el cuadrado que analiza el clasificador)
+  const S = Math.min(w, h), ox = (w - S) / 2, oy = (h - S) / 2;
+  x128.drawImage(source, ox, oy, S, S, 0, 0, 128, 128);
+  const pc = await probFn(c128);
+  if (pc >= thr && !out.some((c) => Math.hypot(c.cx - 0.5, c.cy - 0.5) < 0.2)) {
+    const d = detectLesion(x128.getImageData(0, 0, 128, 128)), edge = [];
+    let x0 = 128, y0 = 128, x1 = 0, y1 = 0;
+    if (d.mask) {
+      const m = d.mask;
+      for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) {
+        const i = y * 128 + x;
+        if (!m[i]) continue;
+        x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+        if (x === 0 || y === 0 || x === 127 || y === 127 || !m[i - 1] || !m[i + 1] || !m[i - 128] || !m[i + 128])
+          edge.push((ox + (x / 128) * S) / w, (oy + (y / 128) * S) / h);
+      }
+    }
+    if (!edge.length) {             // sin máscara fiable: círculo aproximado en el centro
+      for (let a = 0; a < 2 * Math.PI; a += 0.05) edge.push(0.5 + (0.25 * S * Math.cos(a)) / w, 0.5 + (0.25 * S * Math.sin(a)) / h);
+      x0 = 32; x1 = 96; y0 = 32; y1 = 96;
+    }
+    out.push({ cx: (ox + ((x0 + x1) / 2 / 128) * S) / w, cy: (oy + ((y0 + y1) / 2 / 128) * S) / h,
+               w: ((x1 - x0 + 1) / 128) * S / w, h: ((y1 - y0 + 1) / 128) * S / h, edge, px: S / 128 / Math.max(w, h),
+               p: pc, central: true });
+  }
+  // fusiona trozos del mismo lunar: si el centro de una detección cae dentro de otra mayor, sobra
+  const area = (c) => c.w * c.h;
+  const merged = out.sort((a, b) => area(b) - area(a)).filter((c, i, arr) =>
+    !arr.slice(0, i).some((o) => Math.abs(c.cx - o.cx) < o.w * 0.6 && Math.abs(c.cy - o.cy) < o.h * 0.6));
+  return merged.sort((a, b) => Math.hypot(a.cx - 0.5, a.cy - 0.5) - Math.hypot(b.cx - 0.5, b.cy - 0.5));
 }
 
 // nitidez: varianza del laplaciano sobre la luminancia (valores bajos = desenfocado)
@@ -128,9 +243,18 @@ function sharpness(imgData) {
 }
 
 // dibuja el contorno de la máscara en un canvas de overlay
-function drawOutline(canvas, det, color) {
+function drawOutline(canvas, det, color, others) {
   const ctx = canvas.getContext("2d"), W = 128;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // otras manchas candidatas, en blanco y más finas
+  if (others) {
+    ctx.fillStyle = "rgba(255,255,255,0.7)";
+    const k = canvas.width;
+    for (const c of others) {
+      if (det && det.found && Math.hypot(c.cx - det.cx, c.cy - det.cy) < 0.04) continue;
+      for (let j = 0; j < c.edge.length; j += 2) ctx.fillRect(c.edge[j] * k - 1.5, c.edge[j + 1] * k - 1.5, 3, 3);
+    }
+  }
   if (!det || !det.mask) return;
   const k = canvas.width / W, m = det.mask;
   ctx.fillStyle = color;

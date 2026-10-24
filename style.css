@@ -125,3 +125,10 @@ input[type=range] { width: 100%; accent-color: var(--primary); }
 .zoom-row { display: grid; grid-template-columns: auto 1fr 44px; gap: 10px; align-items: center; font-size: 14px; }
 .zoom-val { font: 500 13px var(--mono); text-align: right; }
 @media (prefers-reduced-motion: reduce) { .focus-dot.pulse { animation: none; } .meter-fill { transition: none; } }
+.cands { display: flex; flex-direction: column; gap: 8px; }
+.cands p { margin: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { min-height: 40px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface);
+  color: var(--text); font: 600 14px var(--font); cursor: pointer; }
+.chip.sel { background: var(--low-bg); color: var(--low); border-color: var(--low); }
+.chip:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }

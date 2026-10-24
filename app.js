@@ -19,6 +19,8 @@ const SIZE = 224, HIST_KEY = "dermascan.history";
 
 const $ = (id) => document.getElementById(id);
 let cfg, session, img, view = { scale: 1, x: 0, y: 0 };
+// detector neuronal "lunar / no lunar" (opcional) y lunares encontrados en la foto actual
+let detSession = null, cands = [], selected = -1;
 
 // ---------- navegación ----------
 function show(id) {
@@ -41,8 +43,95 @@ async function loadModel() {
   // la ruta del modelo puede venir en config.json (en la versión web se publica con otra extensión)
   const bytes = new Uint8Array(await (await fetch(cfg.model_file || "model/model.onnx")).arrayBuffer());
   session = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"] });
+  if (cfg.det_file) {
+    try {
+      const db = new Uint8Array(await (await fetch(cfg.det_file)).arrayBuffer());
+      detSession = await ort.InferenceSession.create(db, { executionProviders: ["wasm"] });
+    } catch (e) { console.warn("detector no disponible", e); }
+  }
   busy(null);
   return session;
+}
+
+// probabilidad de "hay un lunar" en un recorte cuadrado (red neuronal); null si no hay detector
+async function lesionProb(canvas) {
+  if (!detSession) return null;
+  const c = canvas.width === 128 ? canvas : (() => {
+    const t = document.createElement("canvas"); t.width = t.height = 128;
+    t.getContext("2d").drawImage(canvas, 0, 0, 128, 128); return t;
+  })();
+  return (await detSession.run({ input: toTensor(c, false, 128) })).probs.data[1];
+}
+const isLesion = (p, fallback) => (p == null ? fallback : p >= cfg.det_threshold);
+
+// busca todos los lunares de la foto: el detector clásico propone manchas y la red confirma cada una
+async function findLesions() {
+  cands = detSession ? await locateLesions(img, img.width, img.height, lesionProb, cfg.det_threshold) : [];
+  selected = cands.length ? 0 : -1;
+  renderCandList();
+  draw();
+}
+
+// ---------- lunares detectados: contorno, número y selección ----------
+function toCanvasXY(nx, ny) {
+  const cv = $("cropCanvas"), s = baseScale() * view.scale;
+  return [(cv.width - img.width * s) / 2 + view.x + nx * img.width * s, (cv.height - img.height * s) / 2 + view.y + ny * img.height * s];
+}
+// dibuja contornos (escala 600 = lienzo de encuadre). onlySel: solo el elegido (para la miniatura del resultado)
+function drawCands(ctx, size, onlySel) {
+  const k = size / 600, s = baseScale() * view.scale;
+  cands.forEach((c, i) => {
+    if (onlySel && i !== selected) return;
+    const sel = i === selected, dot = Math.max(2, c.px * Math.max(img.width, img.height) * s * 0.9) * k;
+    ctx.fillStyle = sel ? "#4ade80" : "rgba(255,255,255,0.85)";
+    for (let j = 0; j < c.edge.length; j += 2) {
+      const [x, y] = toCanvasXY(c.edge[j], c.edge[j + 1]);
+      ctx.fillRect(x * k - dot / 2, y * k - dot / 2, dot, dot);
+    }
+    if (onlySel) return;
+    const [bx, by] = toCanvasXY(c.cx, c.cy - c.h / 2);
+    ctx.beginPath(); ctx.arc(bx, Math.max(16, by - 16), 13, 0, 2 * Math.PI);
+    ctx.fillStyle = sel ? "#4ade80" : "#ffffff"; ctx.fill();
+    ctx.fillStyle = "#0b1716"; ctx.font = "700 15px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(i + 1), bx, Math.max(16, by - 16));
+  });
+}
+function renderCandList() {
+  const n = cands.length;
+  $("candBox").hidden = false;
+  $("candText").textContent = !n
+    ? (detSession ? "No se detectó ningún lunar con seguridad. Encuadra el lunar dentro del círculo a mano." : "")
+    : n === 1 ? "Lunar detectado (contorno verde). Tócalo para centrarlo y ampliarlo."
+    : `Se detectaron ${n} lunares. Toca el que quieres analizar, en la foto o aquí abajo.`;
+  $("candChips").innerHTML = n > 1 ? cands.map((c, i) =>
+    `<button class="chip${i === selected ? " sel" : ""}" data-i="${i}">Lunar ${i + 1}</button>`).join("") : "";
+}
+// elige un lunar y lo centra/amplía para que la red lo vea como en el entrenamiento
+function selectCand(i) {
+  const c = cands[i], cv = $("cropCanvas");
+  if (!c) return;
+  selected = i;
+  const side = Math.max(c.w * img.width, c.h * img.height) * 2.5;
+  view.scale = Math.min(6, Math.max(1, cv.width / side / baseScale()));
+  const s = baseScale() * view.scale;
+  view.x = -(c.cx * img.width - img.width / 2) * s;
+  view.y = -(c.cy * img.height - img.height / 2) * s;
+  $("zoom").value = view.scale;
+  renderCandList();
+  draw();
+}
+function tapAt(clientX, clientY) {
+  if (!cands.length) return;
+  const cv = $("cropCanvas"), r = cv.getBoundingClientRect(), s = baseScale() * view.scale;
+  const X = (clientX - r.left) * (cv.width / r.width), Y = (clientY - r.top) * (cv.height / r.height);
+  const nx = (X - ((cv.width - img.width * s) / 2 + view.x)) / (img.width * s);
+  const ny = (Y - ((cv.height - img.height * s) / 2 + view.y)) / (img.height * s);
+  let bestI = -1, bestD = Infinity;
+  cands.forEach((c, i) => {
+    const d = Math.hypot((nx - c.cx) / Math.max(c.w, 0.03), (ny - c.cy) / Math.max(c.h, 0.03));
+    if (d < 1.5 && d < bestD) { bestD = d; bestI = i; }
+  });
+  if (bestI >= 0) selectCand(bestI);
 }
 
 // ---------- carga y encuadre de la imagen ----------
@@ -71,9 +160,11 @@ function openFrame(source, w, h) {
   img = c;
   $("zoom").value = 1;
   view = { scale: 1, x: 0, y: 0 };
+  cands = []; selected = -1;
+  $("candBox").hidden = true;
   show("vCrop");
   draw();
-  loadModel().catch(fail);
+  loadModel().then(findLesions).catch(fail);
 }
 
 function baseScale() {
@@ -93,6 +184,10 @@ function draw() {
   ctx.imageSmoothingQuality = "high";
   const w = img.width * s, h = img.height * s;
   ctx.drawImage(img, (cv.width - w) / 2 + view.x, (cv.height - h) / 2 + view.y, w, h);
+  // los contornos van en un lienzo aparte para no contaminar la imagen que analiza el modelo
+  const octx = $("cropOverlay").getContext("2d");
+  octx.clearRect(0, 0, 600, 600);
+  drawCands(octx, 600, false);
   checkQuality();
 }
 
@@ -100,7 +195,11 @@ function setupPan() {
   const box = $("cropBox"), pts = new Map();
   let last = null, pinch = null;
   const ratio = () => $("cropCanvas").width / box.clientWidth;
-  box.addEventListener("pointerdown", (e) => { box.setPointerCapture(e.pointerId); pts.set(e.pointerId, e); last = e; });
+  let down = null, multi = false;
+  box.addEventListener("pointerdown", (e) => {
+    box.setPointerCapture(e.pointerId); pts.set(e.pointerId, e); last = e;
+    if (pts.size === 1) { down = { x: e.clientX, y: e.clientY }; multi = false; } else multi = true;
+  });
   box.addEventListener("pointermove", (e) => {
     if (!pts.has(e.pointerId)) return;
     pts.set(e.pointerId, e);
@@ -116,7 +215,12 @@ function setupPan() {
       draw();
     }
   });
-  const up = (e) => { pts.delete(e.pointerId); pinch = null; last = [...pts.values()][0] || null; };
+  const up = (e) => {
+    // un toque corto sin arrastrar selecciona el lunar tocado
+    if (e.type === "pointerup" && down && !multi && pts.size === 1 && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 8)
+      tapAt(e.clientX, e.clientY);
+    pts.delete(e.pointerId); pinch = null; last = [...pts.values()][0] || null;
+  };
   box.addEventListener("pointerup", up);
   box.addEventListener("pointercancel", up);
   box.addEventListener("wheel", (e) => { e.preventDefault(); setZoom(view.scale * (e.deltaY < 0 ? 1.1 : 0.9)); }, { passive: false });
@@ -159,22 +263,20 @@ function checkQuality() {
     if (mean < 60) msgs.push("La foto está muy oscura; busca más luz.");
     if (mean > 225) msgs.push("La foto está sobreexpuesta; evita el flash o la luz directa.");
     if (lapVar < 25) msgs.push("La foto parece desenfocada; vuelve a tomarla esperando el enfoque.");
-    const det = detectLesion(cropped(128).getContext("2d").getImageData(0, 0, 128, 128));
-    if (!det.found && det.reason !== "dark") msgs.push(DETECT_MSG[det.reason] + ".");
     $("quality").hidden = !msgs.length;
     $("quality").textContent = msgs.join(" ");
   }, 120);
 }
 
 // ---------- inferencia ----------
-function toTensor(canvas, flip) {
-  const { data } = canvas.getContext("2d").getImageData(0, 0, SIZE, SIZE);
-  const t = new Float32Array(3 * SIZE * SIZE), plane = SIZE * SIZE;
-  for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
-    const src = 4 * (y * SIZE + (flip ? SIZE - 1 - x : x)), dst = y * SIZE + x;
+function toTensor(canvas, flip, size = SIZE) {
+  const { data } = canvas.getContext("2d").getImageData(0, 0, size, size);
+  const t = new Float32Array(3 * size * size), plane = size * size;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const src = 4 * (y * size + (flip ? size - 1 - x : x)), dst = y * size + x;
     for (let c = 0; c < 3; c++) t[c * plane + dst] = (data[src + c] / 255 - MEAN[c]) / STD[c];
   }
-  return new ort.Tensor("float32", t, [1, 3, SIZE, SIZE]);
+  return new ort.Tensor("float32", t, [1, 3, size, size]);
 }
 
 async function analyze() {
@@ -188,8 +290,12 @@ async function analyze() {
     const probs = Array.from(a, (v, i) => (v + b[i]) / 2);
     const risk = cfg.malignant_classes.reduce((s, k) => s + probs[cfg.classes.indexOf(k)], 0);
     const level = risk >= cfg.threshold_high ? "high" : risk >= cfg.threshold_moderate ? "mid" : "low";
-    const thumb = cropped(112).toDataURL("image/jpeg", 0.8);
-    $("detNote").hidden = detectLesion(cropped(128).getContext("2d").getImageData(0, 0, 128, 128)).found;
+    // miniatura con el contorno del lunar analizado, para comprobar qué se analizó
+    const tc = cropped(224);
+    drawCands(tc.getContext("2d"), 224, true);
+    const thumb = tc.toDataURL("image/jpeg", 0.85);
+    const c128 = cropped(128);
+    $("detNote").hidden = isLesion(await lesionProb(c128), detectLesion(c128.getContext("2d").getImageData(0, 0, 128, 128)).found);
     renderResult({ probs, risk, level, thumb, date: Date.now() });
     saveHistory({ risk, level, thumb, date: Date.now(), top: cfg.classes[probs.indexOf(Math.max(...probs))] });
   } catch (e) { fail(e); } finally { busy(null); }
@@ -264,6 +370,7 @@ setupPan();
 // Mientras apuntas: detección del lunar (detect.js), medidor de nitidez, linterna, zoom y tocar para enfocar.
 // Al capturar se usa el fotograma más nítido del último 1,5 s, no el del instante del toque.
 let stream = null, track = null, caps = {}, loopTimer = null, best = null, torchOn = false;
+let liveP = null, liveBusy = false, liveTick = 0;
 const liveCamera = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && window.top === window && isSecureContext;
 const small = document.createElement("canvas");
 small.width = small.height = 128;
@@ -295,7 +402,7 @@ async function startCamera() {
     z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1; z.value = start;
     setCamZoom(start);
   }
-  best = null;
+  best = null; liveP = null;
   $("video").srcObject = stream;
   show("vCamera");
   $("video").play().catch(() => {});
@@ -319,8 +426,14 @@ function loop() {
     const s = Math.min(v.videoWidth, v.videoHeight);
     smallCtx.drawImage(v, (v.videoWidth - s) / 2, (v.videoHeight - s) / 2, s, s, 0, 0, 128, 128);
     const id = smallCtx.getImageData(0, 0, 128, 128);
-    const det = detectLesion(id), sh = sharpness(id), sharp = sh >= SHARP_OK;
-    drawOutline($("camOverlay"), det, det.found ? "#4ade80" : "#fbbf24");
+    const det = detectLesion(id), sh = sharpness(id);
+    if (detSession && !liveBusy && ++liveTick % 3 === 0) {
+      liveBusy = true;
+      lesionProb(small).then((p) => { liveP = p; }).finally(() => { liveBusy = false; });
+    }
+    det.found = isLesion(liveP, det.found);
+    const sharp = sh >= SHARP_OK;
+    drawOutline($("camOverlay"), det, det.found ? "#4ade80" : "#fbbf24", findCandidates(id, { minArea: 0.004 }));
     $("camRing").classList.toggle("ok", det.found && sharp);
     $("camStatus").textContent = !det.found ? DETECT_MSG[det.reason]
       : sharp ? "Lunar detectado y enfocado: pulsa Capturar" : "Lunar detectado: mantén el teléfono quieto para enfocar";
@@ -377,6 +490,10 @@ $("btnTorch").addEventListener("click", () => {
   $("btnTorch").setAttribute("aria-pressed", String(torchOn));
 });
 $("camZoom").addEventListener("input", (e) => setCamZoom(e.target.value));
+$("candChips").addEventListener("click", (e) => {
+  const b = e.target.closest(".chip");
+  if (b) selectCand(+b.dataset.i);
+});
 $("btnCamera").addEventListener("click", (e) => {
   if (!liveCamera) return;      // sin cámara en vivo: la etiqueta abre el <input capture>
   e.preventDefault();

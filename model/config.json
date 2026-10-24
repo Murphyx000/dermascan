@@ -21,5 +21,11 @@
     "sensitivity": 0.9233870967741935,
     "specificity": 0.863013698630137,
     "test_set": "PAD-UFES-20 (fotos de smartphone)"
+  },
+  "det_file": "model/det.onnx",
+  "det_threshold": 0.424,
+  "det_metrics": {
+    "detection_rate": 0.9994532531437944,
+    "false_alarm_rate": 0.03801396431342126
   }
 }
