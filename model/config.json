@@ -1,0 +1,25 @@
+{
+  "classes": [
+    "akiec",
+    "bcc",
+    "bkl",
+    "df",
+    "mel",
+    "nv",
+    "vasc"
+  ],
+  "malignant_classes": [
+    "akiec",
+    "bcc",
+    "mel"
+  ],
+  "threshold_moderate": 0.186,
+  "threshold_high": 0.557,
+  "metrics": {
+    "n_test": 1477,
+    "auc": 0.8990029478064853,
+    "sensitivity": 0.9006849315068494,
+    "specificity": 0.6953586497890295,
+    "test_set": "de validación HAM10000 (modelo provisional)"
+  }
+}

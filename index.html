@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DermaScan</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;600;800&family=IBM+Plex+Mono:wght@500&display=swap">
+<meta name="description" content="Análisis preliminar de lunares con IA en el dispositivo (prototipo de tesis)">
+<meta name="theme-color" content="#0f766e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.svg" alt="" width="28" height="28"> DermaScan</div>
+  <nav class="nav">
+    <button id="btnQr" class="ghost">QR</button>
+    <button id="btnHistory" class="ghost">Historial</button>
+  </nav>
+</header>
+
+<main>
+  <div id="errBox" class="err" role="alert" hidden></div>
+  <!-- Pantalla inicio -->
+  <section id="vHome" class="view">
+    <div class="hero">
+      <h1>Analiza un lunar</h1>
+      <p>Toma una foto cercana y nítida. El análisis se hace en tu teléfono; la imagen no sale del dispositivo.</p>
+    </div>
+    <label id="btnCamera" class="btn primary big">
+      <input id="inCamera" type="file" accept="image/*" capture="environment" hidden>
+      Tomar foto
+    </label>
+    <p id="camDenied" class="err" hidden>No se pudo usar la cámara en vivo. Para activarla en iPhone, ve a Ajustes → Safari → Cámara → Permitir. Mientras tanto puedes usar
+      <label class="link">la cámara del sistema<input type="file" accept="image/*" capture="environment" hidden class="inAlt"></label>.</p>
+    <label class="btn big">
+      <input id="inGallery" type="file" accept="image/*" hidden>
+      Elegir de la galería
+    </label>
+    <div class="examples">
+      <span class="eyebrow">¿Sin un lunar a mano? Prueba con un ejemplo</span>
+      <div class="ex-row">
+        <button class="ex" data-src="examples/nev.jpg"><img src="examples/nev.jpg" alt="">Nevus</button>
+        <button class="ex" data-src="examples/bcc.jpg"><img src="examples/bcc.jpg" alt="">Basocelular</button>
+        <button class="ex" data-src="examples/mel.jpg"><img src="examples/mel.jpg" alt="">Melanoma</button>
+      </div>
+      <small class="muted">Fotos de smartphone con diagnóstico confirmado por biopsia, del conjunto de prueba de PAD-UFES-20 (CC BY 4.0). El modelo no las vio durante el entrenamiento.</small>
+    </div>
+    <ul class="tips">
+      <li>Usa buena luz natural, sin flash ni sombras.</li>
+      <li>Acerca la cámara (~10 cm) y espera a que enfoque.</li>
+      <li>Deja el lunar centrado, con algo de piel sana alrededor.</li>
+    </ul>
+    <p class="disclaimer">Prototipo académico. <strong>No es un diagnóstico médico.</strong> Ante cualquier cambio en un lunar consulta a un dermatólogo.</p>
+  </section>
+
+  <!-- Cámara en vivo -->
+  <section id="vCamera" class="view" hidden>
+    <h2>Apunta al lunar</h2>
+    <p class="muted">Acerca el teléfono unos 10 cm, deja el lunar dentro del círculo y espera a que enfoque.</p>
+    <div class="crop cam">
+      <video id="video" playsinline muted autoplay></video>
+      <div class="ring" aria-hidden="true"></div>
+    </div>
+    <div class="row">
+      <button id="btnCamCancel" class="btn">Cancelar</button>
+      <button id="btnSnap" class="btn primary">Capturar</button>
+    </div>
+  </section>
+
+  <!-- Pantalla encuadre -->
+  <section id="vCrop" class="view" hidden>
+    <h2>Encuadra el lunar</h2>
+    <p class="muted">Arrastra para mover y usa el control para acercar. El lunar debe quedar dentro del círculo.</p>
+    <div id="cropBox" class="crop">
+      <canvas id="cropCanvas" width="600" height="600"></canvas>
+      <div class="ring" aria-hidden="true"></div>
+    </div>
+    <input id="zoom" type="range" min="1" max="6" step="0.01" value="1" aria-label="Zoom">
+    <div id="quality" class="quality" hidden></div>
+    <div class="row">
+      <button id="btnBack" class="btn">Volver</button>
+      <button id="btnAnalyze" class="btn primary">Analizar</button>
+    </div>
+  </section>
+
+  <!-- Pantalla resultado -->
+  <section id="vResult" class="view" hidden>
+    <div id="riskCard" class="risk">
+      <img id="resImg" alt="Lunar analizado">
+      <div>
+        <div class="risk-label" id="riskLabel"></div>
+        <div class="risk-score" id="riskScore"></div>
+      </div>
+    </div>
+    <p id="riskText" class="risk-text"></p>
+    <h3>Probabilidad por tipo de lesión</h3>
+    <div id="bars" class="bars"></div>
+    <details class="info">
+      <summary>¿Cómo funciona?</summary>
+      <p>Una red neuronal (MobileNetV3) entrenada con 10.015 imágenes dermatoscópicas (HAM10000) y ajustada con 2.298 fotos clínicas tomadas con smartphone (PAD-UFES-20) estima la probabilidad de 7 tipos de lesión. El riesgo es la suma de las probabilidades de melanoma, carcinoma basocelular y queratosis actínica / carcinoma escamoso.</p>
+      <p id="modelStats"></p>
+      <p>Limitación importante: la calidad de la foto (luz, enfoque, distancia) afecta mucho al resultado, y el modelo no ha tenido validación clínica.</p>
+    </details>
+    <p class="disclaimer">Este resultado es orientativo y <strong>no reemplaza la evaluación de un dermatólogo</strong>.</p>
+    <div class="row">
+      <button id="btnNew" class="btn primary">Nuevo análisis</button>
+    </div>
+  </section>
+
+  <!-- QR para abrir la app en otro teléfono -->
+  <section id="vQr" class="view" hidden>
+    <h2>Abrir en el celular</h2>
+    <p class="muted">Escanea el código con la cámara del teléfono. La app se abre en el navegador, sin instalar nada.</p>
+    <div class="qr-card">
+      <div id="qrBox" class="qr" aria-label="Código QR del enlace de la app"></div>
+      <input id="qrLink" class="qr-link" type="text" readonly aria-label="Enlace de la app">
+    </div>
+    <div class="row">
+      <button id="btnQrBack" class="btn">Volver</button>
+      <button id="btnCopy" class="btn primary">Copiar enlace</button>
+    </div>
+    <p class="muted small">Si el enlace es privado, solo lo abre quien tenga acceso. Compártelo desde el menú Compartir de claude.ai.</p>
+  </section>
+
+  <!-- Historial -->
+  <section id="vHistory" class="view" hidden>
+    <h2>Historial</h2>
+    <p class="muted">Guardado solo en este dispositivo.</p>
+    <div id="histList" class="hist"></div>
+    <div class="row">
+      <button id="btnHistBack" class="btn">Volver</button>
+      <button id="btnHistClear" class="btn danger">Borrar todo</button>
+    </div>
+    <div id="histConfirm" class="row" hidden>
+      <button id="btnHistCancel" class="btn">Cancelar</button>
+      <button id="btnHistYes" class="btn danger-solid">Sí, borrar historial</button>
+    </div>
+  </section>
+</main>
+
+<div id="busy" class="busy" hidden><div class="spinner"></div><span id="busyText">Cargando modelo…</span></div>
+
+<script src="vendor/ort.min.js"></script>
+<script src="vendor/qrcode.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
