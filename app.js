@@ -55,6 +55,7 @@ async function loadModel() {
     try {
       const sb = new Uint8Array(await (await fetch(cfg.seg_file)).arrayBuffer());
       segSession = await ort.InferenceSession.create(sb, { executionProviders: ["wasm"] });
+      SEGP.stretch = !!cfg.seg_stretch;
     } catch (e) { console.warn("segmentador no disponible", e); }
   }
   busy(null);
@@ -180,7 +181,7 @@ async function tapAt(clientX, clientY) {
   // escalas relativas a lo que se ve en pantalla, para que el zoom del usuario ayude
   const vis = 1 / view.scale;
   const l = await lesionAt(img, img.width, img.height, nx, ny, segProb, detSession && lesionProb, cfg.det_threshold,
-                           { keepAll: true, scales: [0.15, 0.3, 0.6].map((f) => f * vis) });
+                           { keepAll: true, retryLow: true, scales: [0.15, 0.3, 0.6].map((f) => f * vis) });
   if (run !== findRun) return;
   if (!l) {
     renderCandList();
@@ -492,12 +493,12 @@ function loop() {
       if (!liveBusy && ++liveTick % 2 === 0) {
         liveBusy = true;
         const vw = v.videoWidth, vh = v.videoHeight, x0 = (vw - s) / 2, y0 = (vh - s) / 2;
-        lesionAt(v, vw, vh, 0.5, 0.5, segProb, detSession && lesionProb, cfg.det_threshold, { keepAll: true, scales: [1, 0.55] })
+        lesionAt(v, vw, vh, 0.5, 0.5, segProb, detSession && lesionProb, cfg.det_threshold, { keepAll: true, retryLow: true, scales: [1, 0.55] })
           .then((l) => {
             if (!l) { liveSeg = { reason: "none" }; return; }
             const ext = Math.max(l.w * vw, l.h * vh) / s, dc = Math.hypot((l.cx * vw - vw / 2) / s, (l.cy * vh - vh / 2) / s);
             liveSeg = { contour: l.contour.map(([x, y]) => [(x * vw - x0) / s, (y * vh - y0) / s]),
-                        reason: l.p != null && l.p < cfg.det_threshold ? "none" : dc > 0.25 ? "off_center"
+                        reason: l.p != null && l.p < cfg.det_threshold * 0.5 ? "none" : dc > 0.25 ? "off_center"
                           : ext < 0.06 ? "small" : ext > 0.8 ? "big" : "ok" };
           })
           .catch(() => {}).finally(() => { liveBusy = false; });

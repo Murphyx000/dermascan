@@ -234,7 +234,32 @@ async function locateLesions(source, w, h, probFn, thr) {
 // segFn(canvas SEG×SEG) -> Float32Array con la probabilidad de lesión por píxel.
 // La red da el contorno preciso; el detector "lunar / no lunar" (probFn) confirma cada lesión.
 const SEG = 192;
-const SEGP = { thr: 0.5, minArea: 0.004, maxArea: 0.6, target: 0.5 };
+// thr: núcleo de la lesión; low: el borde se extiende mientras la probabilidad supere low (histéresis, recupera
+// el borde de lunares de color parecido a la piel); stretch: realce de contraste (si el modelo se entrenó con él)
+const SEGP = { thr: 0.5, low: 0.35, minArea: 0.004, maxArea: 0.6, target: 0.5, stretch: false };
+
+// realce de contraste por canal: percentiles 1 y 99 (sin el negro de relleno) a 0-255, ganancia máxima 3.
+// Idéntico a stretch() de ml/train_seg.py
+function stretchContrast(imgData) {
+  const d = imgData.data, n = d.length / 4, valid = new Uint8Array(n);
+  let nv = 0;
+  for (let i = 0; i < n; i++) if (d[4 * i] + d[4 * i + 1] + d[4 * i + 2] > 15) { valid[i] = 1; nv++; }
+  if (nv < 100) return imgData;
+  const lut = [];
+  for (let c = 0; c < 3; c++) {
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < n; i++) if (valid[i]) hist[d[4 * i + c]]++;
+    const at = (rank) => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > rank) return v; } return 255; };
+    const lo = at(Math.floor(0.01 * (nv - 1))), hi = at(Math.floor(0.99 * (nv - 1)));
+    const g = Math.min(3, 255 / Math.max(hi - lo, 1)), mid = (lo + hi) / 2;
+    lut.push(Array.from({ length: 256 }, (_, v) => Math.floor(Math.min(255, Math.max(0, (v - mid) * g + 127.5)))));
+  }
+  for (let i = 0; i < n; i++) {
+    if (!valid[i]) { d[4 * i] = d[4 * i + 1] = d[4 * i + 2] = 0; continue; }
+    for (let c = 0; c < 3; c++) d[4 * i + c] = lut[c][d[4 * i + c]];
+  }
+  return imgData;
+}
 
 // contorno exterior de la componente `id` (seguimiento de borde de Moore), en píxeles de la máscara
 function traceContour(lab, W, H, id) {
@@ -276,7 +301,7 @@ function smoothContour(pts, r = 2) {
 
 // segmenta un recorte cuadrado de la imagen (x0, y0, lado en píxeles de la imagen; lo que sobresale queda negro)
 // y devuelve sus componentes, con contorno en coordenadas normalizadas de la imagen
-async function segmentRegion(source, w, h, x0, y0, side, segFn) {
+async function segmentRegion(source, w, h, x0, y0, side, segFn, thr = SEGP.thr) {
   const c = document.createElement("canvas");
   c.width = c.height = SEG;
   const ctx = c.getContext("2d", { willReadFrequently: true });
@@ -284,10 +309,11 @@ async function segmentRegion(source, w, h, x0, y0, side, segFn) {
   ctx.imageSmoothingQuality = "high";
   const k = SEG / side;
   ctx.drawImage(source, -x0 * k, -y0 * k, w * k, h * k);
-  const prob = await segFn(c), N = SEG * SEG;
+  if (SEGP.stretch) ctx.putImageData(stretchContrast(ctx.getImageData(0, 0, SEG, SEG)), 0, 0);
+  const prob = await segFn(c), N = SEG * SEG, low = Math.min(thr, SEGP.low);
   const lab = new Int32Array(N).fill(-1), stack = new Int32Array(N), comps = [];
   for (let s0 = 0; s0 < N; s0++) {
-    if (prob[s0] < SEGP.thr || lab[s0] >= 0) continue;
+    if (prob[s0] < thr || lab[s0] >= 0) continue;
     const id = comps.length;
     let sp = 0, area = 0, psum = 0, sx = 0, sy = 0, bx0 = SEG, by0 = SEG, bx1 = 0, by1 = 0, edge = false;
     stack[sp++] = s0; lab[s0] = id;
@@ -298,7 +324,7 @@ async function segmentRegion(source, w, h, x0, y0, side, segFn) {
       if (x === 0 || y === 0 || x === SEG - 1 || y === SEG - 1) edge = true;
       for (const q of [p - 1, p + 1, p - SEG, p + SEG]) {
         if (q < 0 || q >= N || (q % SEG === 0 && p % SEG === SEG - 1) || (p % SEG === 0 && q % SEG === SEG - 1)) continue;
-        if (lab[q] < 0 && prob[q] >= SEGP.thr) { lab[q] = id; stack[sp++] = q; }
+        if (lab[q] < 0 && prob[q] >= low) { lab[q] = id; stack[sp++] = q; }
       }
     }
     comps.push({ id, area, areaFrac: area / N, meanP: psum / area, mx: sx / area, my: sy / area,
@@ -328,18 +354,21 @@ async function lesionAt(source, w, h, nx, ny, segFn, probFn, thr, opts = {}) {
                                                   (c.hitC || c.distC <= maxD))
     .sort((a, b) => (b.hitC - a.hitC) || (a.distC - b.distC))[0];
   let best = null;
+  const st = opts.segThr || SEGP.thr;
   for (const f of opts.scales || [0.2, 0.35, 0.6, 1]) {
     const side = f * m;
-    const c = pick(await segmentRegion(source, w, h, px - side / 2, py - side / 2, side, segFn), 0.12);
+    const c = pick(await segmentRegion(source, w, h, px - side / 2, py - side / 2, side, segFn, st), 0.12);
     // escala preferida: lesión de tamaño parecido al del entrenamiento y con forma compacta (a escalas grandes la
     // red puede fundir dos lunares vecinos o un pelo en una sola mancha ramificada)
     const cost = (x) => Math.abs(x.ext - SEGP.target) + (x.compact < 0.45 ? 0.6 : 0);
     if (c && (!best || cost(c) < cost(best.c))) best = { c, side };
   }
+  // lunar tenue (color parecido a la piel): la red da probabilidades más bajas; segundo intento más sensible
+  if (!best && opts.retryLow && st > 0.3) return lesionAt(source, w, h, nx, ny, segFn, probFn, thr, { ...opts, segThr: 0.3, retryLow: false });
   if (!best) return null;
   // refinado: recorte centrado en la lesión con la lesión ocupando ~la mitad
   const side = Math.max(32, (best.c.ext * best.side) / SEGP.target), cx = best.c.cx * w, cy = best.c.cy * h;
-  const r = pick(await segmentRegion(source, w, h, cx - side / 2, cy - side / 2, side, segFn), 0.2) || best.c;
+  const r = pick(await segmentRegion(source, w, h, cx - side / 2, cy - side / 2, side, segFn, st), 0.2) || best.c;
   const lesion = { cx: r.cx, cy: r.cy, w: r.w, h: r.h, contour: r.contour, meanP: r.meanP };
   if (probFn) {
     const ps = Math.max(48, Math.max(r.w * w, r.h * h) * 2), t = document.createElement("canvas");
@@ -348,7 +377,7 @@ async function lesionAt(source, w, h, nx, ny, segFn, probFn, thr, opts = {}) {
     tx.fillStyle = "#000"; tx.fillRect(0, 0, 128, 128);
     tx.drawImage(source, r.cx * w - ps / 2, r.cy * h - ps / 2, ps, ps, 0, 0, 128, 128);
     lesion.p = await probFn(t);
-    if (lesion.p != null && lesion.p < thr && !opts.keepAll) return null;
+    if (lesion.p != null && lesion.p < thr * (opts.thrScale ?? 1) && !opts.keepAll) return null;
   }
   return lesion;
 }
@@ -358,7 +387,8 @@ async function lesionAt(source, w, h, nx, ny, segFn, probFn, thr, opts = {}) {
 async function locateLesionsSeg(source, w, h, segFn, probFn, thr, onUpdate) {
   const out = [];
   const dup = (a) => out.some((o) => Math.abs(a.cx - o.cx) < Math.max(o.w, a.w) * 0.5 && Math.abs(a.cy - o.cy) < Math.max(o.h, a.h) * 0.5);
-  const center = await lesionAt(source, w, h, 0.5, 0.5, segFn, probFn, thr);
+  // el del centro lo encuadró el usuario: búsqueda más sensible y confirmación más permisiva (lunares tenues)
+  const center = await lesionAt(source, w, h, 0.5, 0.5, segFn, probFn, thr, { retryLow: true, thrScale: 0.5 });
   if (center) { center.central = true; out.push(center); onUpdate && onUpdate(out.slice()); }
   const m = Math.min(w, h), side = 0.5 * m, step = 0.25 * m;
   const props = [];
@@ -378,7 +408,8 @@ async function locateLesionsSeg(source, w, h, segFn, probFn, thr, onUpdate) {
     if (dup(c)) continue;
     const ext = Math.max(c.w * w, c.h * h) / m;
     const l = await lesionAt(source, w, h, c.cx, c.cy, segFn, probFn, thr,
-                             { scales: [Math.min(1, Math.max(0.08, ext / 0.3)), Math.min(1, Math.max(0.12, ext / 0.6))] });
+                             { scales: [Math.min(1, Math.max(0.08, ext / 0.3)), Math.min(1, Math.max(0.12, ext / 0.6))],
+                               thrScale: 1.4 });   // fuera del centro se exige más certeza (evita manchas claras de piel)
     if (l && !dup(l)) { out.push(l); onUpdate && onUpdate(out.slice()); }
     if (out.length >= 10) break;
   }

@@ -29,8 +29,9 @@
     "false_alarm_rate": 0.03801396431342126
   },
   "seg_file": "model/seg.onnx",
+  "seg_stretch": true,
   "seg_metrics": {
-    "test_mean_iou": 0.8922857995892773,
-    "model": "seg"
+    "test_mean_iou": 0.8888366248864931,
+    "model": "seg3"
   }
 }
