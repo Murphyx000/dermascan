@@ -27,5 +27,10 @@
   "det_metrics": {
     "detection_rate": 0.9994532531437944,
     "false_alarm_rate": 0.03801396431342126
+  },
+  "seg_file": "model/seg.onnx",
+  "seg_metrics": {
+    "test_mean_iou": 0.8922857995892773,
+    "model": "seg"
   }
 }

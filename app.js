@@ -21,6 +21,8 @@ const $ = (id) => document.getElementById(id);
 let cfg, session, img, view = { scale: 1, x: 0, y: 0 };
 // detector neuronal "lunar / no lunar" (opcional) y lunares encontrados en la foto actual
 let detSession = null, cands = [], selected = -1;
+// segmentador neuronal (contorno preciso de la lesión), opcional
+let segSession = null, findRun = 0;
 
 // ---------- navegación ----------
 function show(id) {
@@ -49,6 +51,12 @@ async function loadModel() {
       detSession = await ort.InferenceSession.create(db, { executionProviders: ["wasm"] });
     } catch (e) { console.warn("detector no disponible", e); }
   }
+  if (cfg.seg_file) {
+    try {
+      const sb = new Uint8Array(await (await fetch(cfg.seg_file)).arrayBuffer());
+      segSession = await ort.InferenceSession.create(sb, { executionProviders: ["wasm"] });
+    } catch (e) { console.warn("segmentador no disponible", e); }
+  }
   busy(null);
   return session;
 }
@@ -63,13 +71,39 @@ async function lesionProb(canvas) {
   return (await detSession.run({ input: toTensor(c, false, 128) })).probs.data[1];
 }
 const isLesion = (p, fallback) => (p == null ? fallback : p >= cfg.det_threshold);
+// probabilidad de lesión por píxel en un recorte de SEG×SEG (segmentador)
+async function segProb(canvas) {
+  return (await segSession.run({ input: toTensor(canvas, false, SEG) })).mask.data;
+}
 
-// busca todos los lunares de la foto: el detector clásico propone manchas y la red confirma cada una
+// busca todos los lunares de la foto. Con segmentador: primero el del centro y luego el resto, pintando
+// cada uno según aparece; sin él, el detector clásico propone manchas y la red confirma cada una
 async function findLesions() {
-  cands = detSession ? await locateLesions(img, img.width, img.height, lesionProb, cfg.det_threshold) : [];
-  selected = cands.length ? 0 : -1;
+  const run = ++findRun;
+  if (segSession) {
+    $("candBox").hidden = false;
+    $("candText").textContent = "Buscando lunares…";
+    $("candChips").innerHTML = "";
+    const res = await locateLesionsSeg(img, img.width, img.height, segProb, detSession && lesionProb, cfg.det_threshold, (list) => {
+      if (run !== findRun) return;
+      mergeFound(list);
+      draw();
+    });
+    if (run !== findRun) return;
+    mergeFound(res);
+  } else {
+    cands = detSession ? await locateLesions(img, img.width, img.height, lesionProb, cfg.det_threshold) : [];
+    selected = cands.length ? 0 : -1;
+  }
   renderCandList();
   draw();
+}
+// añade lo encontrado sin perder lo que el usuario ya tocó (lunares marcados a mano y su selección)
+function mergeFound(list) {
+  const cur = selected >= 0 ? cands[selected] : null, manual = cands.filter((c) => c.manual);
+  const same = (a, b) => Math.abs(a.cx - b.cx) < Math.max(a.w, b.w) * 0.5 && Math.abs(a.cy - b.cy) < Math.max(a.h, b.h) * 0.5;
+  cands = manual.concat(list.filter((c) => !manual.some((m) => same(m, c))));
+  selected = cur ? Math.max(0, cands.findIndex((c) => same(c, cur))) : cands.length ? 0 : -1;
 }
 
 // ---------- lunares detectados: contorno, número y selección ----------
@@ -82,11 +116,17 @@ function drawCands(ctx, size, onlySel) {
   const k = size / 600, s = baseScale() * view.scale;
   cands.forEach((c, i) => {
     if (onlySel && i !== selected) return;
-    const sel = i === selected, dot = Math.max(2, c.px * Math.max(img.width, img.height) * s * 0.9) * k;
-    ctx.fillStyle = sel ? "#4ade80" : "rgba(255,255,255,0.85)";
-    for (let j = 0; j < c.edge.length; j += 2) {
-      const [x, y] = toCanvasXY(c.edge[j], c.edge[j + 1]);
-      ctx.fillRect(x * k - dot / 2, y * k - dot / 2, dot, dot);
+    const sel = i === selected;
+    if (c.contour) {
+      drawContour(ctx, c.contour.map(([x, y]) => toCanvasXY(x, y).map((v) => v * k)), sel ? "#4ade80" : "rgba(255,255,255,0.9)",
+                  (sel ? 3 : 2) * Math.max(0.5, k));
+    } else {
+      const dot = Math.max(2, c.px * Math.max(img.width, img.height) * s * 0.9) * k;
+      ctx.fillStyle = sel ? "#4ade80" : "rgba(255,255,255,0.85)";
+      for (let j = 0; j < c.edge.length; j += 2) {
+        const [x, y] = toCanvasXY(c.edge[j], c.edge[j + 1]);
+        ctx.fillRect(x * k - dot / 2, y * k - dot / 2, dot, dot);
+      }
     }
     if (onlySel) return;
     const [bx, by] = toCanvasXY(c.cx, c.cy - c.h / 2);
@@ -99,10 +139,12 @@ function drawCands(ctx, size, onlySel) {
 function renderCandList() {
   const n = cands.length;
   $("candBox").hidden = false;
+  const hint = segSession ? " Si no es tu lunar, toca el lunar en la foto." : "";
   $("candText").textContent = !n
-    ? (detSession ? "No se detectó ningún lunar con seguridad. Encuadra el lunar dentro del círculo a mano." : "")
-    : n === 1 ? "Lunar detectado (contorno verde). Tócalo para centrarlo y ampliarlo."
-    : `Se detectaron ${n} lunares. Toca el que quieres analizar, en la foto o aquí abajo.`;
+    ? (segSession ? "No se detectó ningún lunar con seguridad. Toca el lunar en la foto para marcarlo, o encuádralo a mano."
+       : detSession ? "No se detectó ningún lunar con seguridad. Encuadra el lunar dentro del círculo a mano." : "")
+    : n === 1 ? "Lunar detectado (contorno verde). Tócalo para centrarlo y ampliarlo." + hint
+    : `Se detectaron ${n} lunares. Toca el que quieres analizar, en la foto o aquí abajo.` + hint;
   $("candChips").innerHTML = n > 1 ? cands.map((c, i) =>
     `<button class="chip${i === selected ? " sel" : ""}" data-i="${i}">Lunar ${i + 1}</button>`).join("") : "";
 }
@@ -120,8 +162,7 @@ function selectCand(i) {
   renderCandList();
   draw();
 }
-function tapAt(clientX, clientY) {
-  if (!cands.length) return;
+async function tapAt(clientX, clientY) {
   const cv = $("cropCanvas"), r = cv.getBoundingClientRect(), s = baseScale() * view.scale;
   const X = (clientX - r.left) * (cv.width / r.width), Y = (clientY - r.top) * (cv.height / r.height);
   const nx = (X - ((cv.width - img.width * s) / 2 + view.x)) / (img.width * s);
@@ -131,7 +172,26 @@ function tapAt(clientX, clientY) {
     const d = Math.hypot((nx - c.cx) / Math.max(c.w, 0.03), (ny - c.cy) / Math.max(c.h, 0.03));
     if (d < 1.5 && d < bestD) { bestD = d; bestI = i; }
   });
-  if (bestI >= 0) selectCand(bestI);
+  if (bestI >= 0) return selectCand(bestI);
+  // ningún lunar marcado ahí: el segmentador busca la lesión en el punto tocado
+  if (!segSession || nx < 0 || ny < 0 || nx > 1 || ny > 1) return;
+  const run = findRun;
+  $("candText").textContent = "Buscando el lunar donde tocaste…";
+  // escalas relativas a lo que se ve en pantalla, para que el zoom del usuario ayude
+  const vis = 1 / view.scale;
+  const l = await lesionAt(img, img.width, img.height, nx, ny, segProb, detSession && lesionProb, cfg.det_threshold,
+                           { keepAll: true, scales: [0.15, 0.3, 0.6].map((f) => f * vis) });
+  if (run !== findRun) return;
+  if (!l) {
+    renderCandList();
+    $("candText").textContent = "No encontré un borde claro donde tocaste. Amplía con el zoom y toca justo encima del lunar.";
+    return;
+  }
+  l.manual = true;
+  cands.push(l);
+  selectCand(cands.length - 1);
+  if (l.p != null && l.p < cfg.det_threshold)
+    $("candText").textContent = "Marcado donde tocaste, pero el detector no está seguro de que sea un lunar. Revisa el contorno antes de analizar.";
 }
 
 // ---------- carga y encuadre de la imagen ----------
@@ -160,7 +220,7 @@ function openFrame(source, w, h) {
   img = c;
   $("zoom").value = 1;
   view = { scale: 1, x: 0, y: 0 };
-  cands = []; selected = -1;
+  cands = []; selected = -1; findRun++;
   $("candBox").hidden = true;
   show("vCrop");
   draw();
@@ -218,7 +278,7 @@ function setupPan() {
   const up = (e) => {
     // un toque corto sin arrastrar selecciona el lunar tocado
     if (e.type === "pointerup" && down && !multi && pts.size === 1 && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 8)
-      tapAt(e.clientX, e.clientY);
+      tapAt(e.clientX, e.clientY).catch(fail);
     pts.delete(e.pointerId); pinch = null; last = [...pts.values()][0] || null;
   };
   box.addEventListener("pointerup", up);
@@ -370,7 +430,7 @@ setupPan();
 // Mientras apuntas: detección del lunar (detect.js), medidor de nitidez, linterna, zoom y tocar para enfocar.
 // Al capturar se usa el fotograma más nítido del último 1,5 s, no el del instante del toque.
 let stream = null, track = null, caps = {}, loopTimer = null, best = null, torchOn = false;
-let liveP = null, liveBusy = false, liveTick = 0;
+let liveP = null, liveBusy = false, liveTick = 0, liveSeg = null;
 const liveCamera = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && window.top === window && isSecureContext;
 const small = document.createElement("canvas");
 small.width = small.height = 128;
@@ -402,7 +462,7 @@ async function startCamera() {
     z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1; z.value = start;
     setCamZoom(start);
   }
-  best = null; liveP = null;
+  best = null; liveP = null; liveSeg = null;
   $("video").srcObject = stream;
   show("vCamera");
   $("video").play().catch(() => {});
@@ -427,13 +487,34 @@ function loop() {
     smallCtx.drawImage(v, (v.videoWidth - s) / 2, (v.videoHeight - s) / 2, s, s, 0, 0, 128, 128);
     const id = smallCtx.getImageData(0, 0, 128, 128);
     const det = detectLesion(id), sh = sharpness(id);
-    if (detSession && !liveBusy && ++liveTick % 3 === 0) {
+    if (segSession && det.reason !== "dark") {
+      // segmentador: contorno preciso del lunar del centro (asíncrono, ~3 veces por segundo)
+      if (!liveBusy && ++liveTick % 2 === 0) {
+        liveBusy = true;
+        const vw = v.videoWidth, vh = v.videoHeight, x0 = (vw - s) / 2, y0 = (vh - s) / 2;
+        lesionAt(v, vw, vh, 0.5, 0.5, segProb, detSession && lesionProb, cfg.det_threshold, { keepAll: true, scales: [1, 0.55] })
+          .then((l) => {
+            if (!l) { liveSeg = { reason: "none" }; return; }
+            const ext = Math.max(l.w * vw, l.h * vh) / s, dc = Math.hypot((l.cx * vw - vw / 2) / s, (l.cy * vh - vh / 2) / s);
+            liveSeg = { contour: l.contour.map(([x, y]) => [(x * vw - x0) / s, (y * vh - y0) / s]),
+                        reason: l.p != null && l.p < cfg.det_threshold ? "none" : dc > 0.25 ? "off_center"
+                          : ext < 0.06 ? "small" : ext > 0.8 ? "big" : "ok" };
+          })
+          .catch(() => {}).finally(() => { liveBusy = false; });
+      }
+      if (liveSeg) { det.reason = liveSeg.reason; det.found = liveSeg.reason === "ok"; }
+    } else if (detSession && !liveBusy && ++liveTick % 3 === 0) {
       liveBusy = true;
       lesionProb(small).then((p) => { liveP = p; }).finally(() => { liveBusy = false; });
     }
-    det.found = isLesion(liveP, det.found);
+    if (!segSession) det.found = isLesion(liveP, det.found);
     const sharp = sh >= SHARP_OK;
-    drawOutline($("camOverlay"), det, det.found ? "#4ade80" : "#fbbf24", findCandidates(id, { minArea: 0.004 }));
+    if (segSession) {
+      const oc = $("camOverlay"), octx = oc.getContext("2d");
+      octx.clearRect(0, 0, oc.width, oc.height);
+      if (liveSeg && liveSeg.contour && det.reason !== "dark")
+        drawContour(octx, liveSeg.contour.map(([x, y]) => [x * oc.width, y * oc.height]), det.found ? "#4ade80" : "#fbbf24", 3);
+    } else drawOutline($("camOverlay"), det, det.found ? "#4ade80" : "#fbbf24", findCandidates(id, { minArea: 0.004 }));
     $("camRing").classList.toggle("ok", det.found && sharp);
     $("camStatus").textContent = !det.found ? DETECT_MSG[det.reason]
       : sharp ? "Lunar detectado y enfocado: pulsa Capturar" : "Lunar detectado: mantén el teléfono quieto para enfocar";

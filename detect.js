@@ -230,6 +230,161 @@ async function locateLesions(source, w, h, probFn, thr) {
   return merged.sort((a, b) => Math.hypot(a.cx - 0.5, a.cy - 0.5) - Math.hypot(b.cx - 0.5, b.cy - 0.5));
 }
 
+// ================= segmentador neuronal (ml/train_seg.py) =================
+// segFn(canvas SEG×SEG) -> Float32Array con la probabilidad de lesión por píxel.
+// La red da el contorno preciso; el detector "lunar / no lunar" (probFn) confirma cada lesión.
+const SEG = 192;
+const SEGP = { thr: 0.5, minArea: 0.004, maxArea: 0.6, target: 0.5 };
+
+// contorno exterior de la componente `id` (seguimiento de borde de Moore), en píxeles de la máscara
+function traceContour(lab, W, H, id) {
+  let s = -1;
+  for (let i = 0; i < W * H; i++) if (lab[i] === id) { s = i; break; }
+  if (s < 0) return [];
+  const DX = [1, 1, 0, -1, -1, -1, 0, 1], DY = [0, 1, 1, 1, 0, -1, -1, -1];   // E, SE, S, SO, O, NO, N, NE
+  const inside = (x, y) => x >= 0 && y >= 0 && x < W && y < H && lab[y * W + x] === id;
+  const sx = s % W, sy = (s / W) | 0, pts = [[sx, sy]];
+  let x = sx, y = sy, back = 4, first = -1;
+  for (let it = 0; it < 4 * W * H; it++) {
+    let moved = -1;
+    for (let k = 1; k <= 8; k++) {
+      const d = (back + k) % 8;
+      if (inside(x + DX[d], y + DY[d])) { moved = d; break; }
+    }
+    if (moved < 0) break;                              // píxel aislado
+    if (x === sx && y === sy) {
+      if (first < 0) first = moved; else if (moved === first) break;
+    }
+    x += DX[moved]; y += DY[moved];
+    back = (moved + 5) % 8;                            // vecino vacío previo, visto desde el nuevo píxel
+    pts.push([x, y]);
+  }
+  if (pts.length > 1) pts.pop();
+  return pts;
+}
+
+// suaviza el contorno (media móvil circular) para que no se vea escalonado
+function smoothContour(pts, r = 2) {
+  const n = pts.length;
+  if (n < 2 * r + 3) return pts;
+  return pts.map((_, i) => {
+    let x = 0, y = 0;
+    for (let k = -r; k <= r; k++) { const p = pts[(i + k + n) % n]; x += p[0]; y += p[1]; }
+    return [x / (2 * r + 1), y / (2 * r + 1)];
+  });
+}
+
+// segmenta un recorte cuadrado de la imagen (x0, y0, lado en píxeles de la imagen; lo que sobresale queda negro)
+// y devuelve sus componentes, con contorno en coordenadas normalizadas de la imagen
+async function segmentRegion(source, w, h, x0, y0, side, segFn) {
+  const c = document.createElement("canvas");
+  c.width = c.height = SEG;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, SEG, SEG);
+  ctx.imageSmoothingQuality = "high";
+  const k = SEG / side;
+  ctx.drawImage(source, -x0 * k, -y0 * k, w * k, h * k);
+  const prob = await segFn(c), N = SEG * SEG;
+  const lab = new Int32Array(N).fill(-1), stack = new Int32Array(N), comps = [];
+  for (let s0 = 0; s0 < N; s0++) {
+    if (prob[s0] < SEGP.thr || lab[s0] >= 0) continue;
+    const id = comps.length;
+    let sp = 0, area = 0, psum = 0, sx = 0, sy = 0, bx0 = SEG, by0 = SEG, bx1 = 0, by1 = 0, edge = false;
+    stack[sp++] = s0; lab[s0] = id;
+    while (sp) {
+      const p = stack[--sp], x = p % SEG, y = (p / SEG) | 0;
+      area++; psum += prob[p]; sx += x; sy += y;
+      if (x < bx0) bx0 = x; if (x > bx1) bx1 = x; if (y < by0) by0 = y; if (y > by1) by1 = y;
+      if (x === 0 || y === 0 || x === SEG - 1 || y === SEG - 1) edge = true;
+      for (const q of [p - 1, p + 1, p - SEG, p + SEG]) {
+        if (q < 0 || q >= N || (q % SEG === 0 && p % SEG === SEG - 1) || (p % SEG === 0 && q % SEG === SEG - 1)) continue;
+        if (lab[q] < 0 && prob[q] >= SEGP.thr) { lab[q] = id; stack[sp++] = q; }
+      }
+    }
+    comps.push({ id, area, areaFrac: area / N, meanP: psum / area, mx: sx / area, my: sy / area,
+                 bx0, by0, bx1, by1, touchesEdge: edge });
+  }
+  const toImg = (px, py) => [(x0 + (px + 0.5) / k) / w, (y0 + (py + 0.5) / k) / h];
+  for (const cp of comps) {
+    const poly = smoothContour(traceContour(lab, SEG, SEG, cp.id));
+    let per = 0;
+    poly.forEach(([x1, y1], i) => { const [x2, y2] = poly[(i + 1) % poly.length]; per += Math.hypot(x2 - x1, y2 - y1); });
+    cp.compact = per ? Math.min(1, (4 * Math.PI * cp.area) / (per * per)) : 0;   // 1 = círculo; bajo = forma ramificada
+    cp.contour = poly.map(([px, py]) => toImg(px, py));
+    [cp.cx, cp.cy] = toImg((cp.bx0 + cp.bx1) / 2, (cp.by0 + cp.by1) / 2);
+    cp.w = (cp.bx1 - cp.bx0 + 1) / k / w; cp.h = (cp.by1 - cp.by0 + 1) / k / h;
+    cp.ext = Math.max(cp.bx1 - cp.bx0 + 1, cp.by1 - cp.by0 + 1) / SEG;    // tamaño relativo al recorte
+    cp.distC = Math.hypot(cp.mx - SEG / 2, cp.my - SEG / 2) / SEG;
+    cp.hitC = lab[(SEG / 2) * SEG + SEG / 2] === cp.id;
+  }
+  return comps;
+}
+
+// la lesión que hay en el punto (nx, ny) de la imagen: prueba varias escalas, se queda con la que encuadra
+// la lesión completa a un tamaño parecido al del entrenamiento y la vuelve a segmentar centrada (borde fino)
+async function lesionAt(source, w, h, nx, ny, segFn, probFn, thr, opts = {}) {
+  const m = Math.min(w, h), px = nx * w, py = ny * h;
+  const pick = (comps, maxD) => comps.filter((c) => !c.touchesEdge && c.areaFrac >= SEGP.minArea && c.areaFrac <= SEGP.maxArea &&
+                                                  (c.hitC || c.distC <= maxD))
+    .sort((a, b) => (b.hitC - a.hitC) || (a.distC - b.distC))[0];
+  let best = null;
+  for (const f of opts.scales || [0.2, 0.35, 0.6, 1]) {
+    const side = f * m;
+    const c = pick(await segmentRegion(source, w, h, px - side / 2, py - side / 2, side, segFn), 0.12);
+    // escala preferida: lesión de tamaño parecido al del entrenamiento y con forma compacta (a escalas grandes la
+    // red puede fundir dos lunares vecinos o un pelo en una sola mancha ramificada)
+    const cost = (x) => Math.abs(x.ext - SEGP.target) + (x.compact < 0.45 ? 0.6 : 0);
+    if (c && (!best || cost(c) < cost(best.c))) best = { c, side };
+  }
+  if (!best) return null;
+  // refinado: recorte centrado en la lesión con la lesión ocupando ~la mitad
+  const side = Math.max(32, (best.c.ext * best.side) / SEGP.target), cx = best.c.cx * w, cy = best.c.cy * h;
+  const r = pick(await segmentRegion(source, w, h, cx - side / 2, cy - side / 2, side, segFn), 0.2) || best.c;
+  const lesion = { cx: r.cx, cy: r.cy, w: r.w, h: r.h, contour: r.contour, meanP: r.meanP };
+  if (probFn) {
+    const ps = Math.max(48, Math.max(r.w * w, r.h * h) * 2), t = document.createElement("canvas");
+    t.width = t.height = 128;
+    const tx = t.getContext("2d");
+    tx.fillStyle = "#000"; tx.fillRect(0, 0, 128, 128);
+    tx.drawImage(source, r.cx * w - ps / 2, r.cy * h - ps / 2, ps, ps, 0, 0, 128, 128);
+    lesion.p = await probFn(t);
+    if (lesion.p != null && lesion.p < thr && !opts.keepAll) return null;
+  }
+  return lesion;
+}
+
+// todos los lunares de la foto: primero el del centro (el usuario lo encuadra ahí) y luego un barrido por
+// ventanas solapadas; cada mancha se refina y la confirma el detector. onUpdate(lista) permite ir pintando.
+async function locateLesionsSeg(source, w, h, segFn, probFn, thr, onUpdate) {
+  const out = [];
+  const dup = (a) => out.some((o) => Math.abs(a.cx - o.cx) < Math.max(o.w, a.w) * 0.5 && Math.abs(a.cy - o.cy) < Math.max(o.h, a.h) * 0.5);
+  const center = await lesionAt(source, w, h, 0.5, 0.5, segFn, probFn, thr);
+  if (center) { center.central = true; out.push(center); onUpdate && onUpdate(out.slice()); }
+  const m = Math.min(w, h), side = 0.5 * m, step = 0.25 * m;
+  const props = [];
+  for (let y0 = 0; y0 + side <= h + 1; y0 += step) for (let x0 = 0; x0 + side <= w + 1; x0 += step) {
+    for (const c of await segmentRegion(source, w, h, x0, y0, side, segFn))
+      if (!c.touchesEdge && c.areaFrac >= 0.0015 && c.meanP >= 0.6) props.push(c);
+  }
+  props.sort((a, b) => b.area * b.meanP - a.area * a.meanP);
+  // más propuestas: las manchas oscuras del detector clásico (encuentra bien varios lunares pequeños juntos);
+  // el segmentador les pone el contorno y el detector neuronal decide si son lunares
+  const k = Math.min(1, 320 / Math.max(w, h)), t = document.createElement("canvas");
+  t.width = Math.round(w * k); t.height = Math.round(h * k);
+  const tx = t.getContext("2d", { willReadFrequently: true });
+  tx.drawImage(source, 0, 0, t.width, t.height);
+  const classic = findCandidates(tx.getImageData(0, 0, t.width, t.height), { max: 10 });
+  for (const c of props.slice(0, 12).concat(classic)) {
+    if (dup(c)) continue;
+    const ext = Math.max(c.w * w, c.h * h) / m;
+    const l = await lesionAt(source, w, h, c.cx, c.cy, segFn, probFn, thr,
+                             { scales: [Math.min(1, Math.max(0.08, ext / 0.3)), Math.min(1, Math.max(0.12, ext / 0.6))] });
+    if (l && !dup(l)) { out.push(l); onUpdate && onUpdate(out.slice()); }
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
 // nitidez: varianza del laplaciano sobre la luminancia (valores bajos = desenfocado)
 function sharpness(imgData) {
   const { data, width: W, height: H } = imgData, g = new Float32Array(W * H);
@@ -240,6 +395,19 @@ function sharpness(imgData) {
     s1 += l; s2 += l * l; n++;
   }
   return s2 / n - (s1 / n) ** 2;
+}
+
+// dibuja un contorno (lista de puntos en píxeles del lienzo) con un halo oscuro para que se vea en cualquier piel
+function drawContour(ctx, pts, color, width = 3) {
+  if (pts.length < 2) return;
+  ctx.save();
+  ctx.lineJoin = ctx.lineCap = "round";
+  ctx.beginPath();
+  pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.closePath();
+  ctx.strokeStyle = "rgba(0,0,0,0.55)"; ctx.lineWidth = width + 2.5; ctx.stroke();
+  ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
+  ctx.restore();
 }
 
 // dibuja el contorno de la máscara en un canvas de overlay
