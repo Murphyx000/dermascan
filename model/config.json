@@ -31,7 +31,7 @@
   "seg_file": "model/seg.onnx",
   "seg_stretch": true,
   "seg_metrics": {
-    "test_mean_iou": 0.8888366248864931,
-    "model": "seg3"
+    "test_mean_iou": 0.8900115740352094,
+    "model": "seg4"
   }
 }

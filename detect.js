@@ -355,12 +355,16 @@ async function lesionAt(source, w, h, nx, ny, segFn, probFn, thr, opts = {}) {
     .sort((a, b) => (b.hitC - a.hitC) || (a.distC - b.distC))[0];
   let best = null;
   const st = opts.segThr || SEGP.thr;
-  for (const f of opts.scales || [0.2, 0.35, 0.6, 1]) {
+  // escalas pequeñas: en una foto a 15-20 cm un lunar ocupa ~2-5 % del lado y la red solo traza bien el borde si
+  // la lesión ocupa al menos ~15 % del recorte (con menos del 10 % falla casi siempre)
+  for (const f of opts.scales || [0.07, 0.12, 0.2, 0.35, 0.6, 1]) {
     const side = f * m;
-    const c = pick(await segmentRegion(source, w, h, px - side / 2, py - side / 2, side, segFn, st), 0.12);
+    // tolerancia al centrado del usuario (~5 % del lado de la foto), mayor en proporción en los recortes pequeños
+    const c = pick(await segmentRegion(source, w, h, px - side / 2, py - side / 2, side, segFn, st), Math.min(0.4, Math.max(0.12, 0.05 / f)));
     // escala preferida: lesión de tamaño parecido al del entrenamiento y con forma compacta (a escalas grandes la
     // red puede fundir dos lunares vecinos o un pelo en una sola mancha ramificada)
-    const cost = (x) => Math.abs(x.ext - SEGP.target) + (x.compact < 0.45 ? 0.6 : 0);
+    // (y seguro: en recortes muy pequeños un poro o un pelo puede dar una mancha débil del tamaño "ideal")
+    const cost = (x) => Math.abs(x.ext - SEGP.target) + (x.compact < 0.45 ? 0.6 : 0) + Math.max(0, 0.8 - x.meanP);
     if (c && (!best || cost(c) < cost(best.c))) best = { c, side };
   }
   // lunar tenue (color parecido a la piel): la red da probabilidades más bajas; segundo intento más sensible

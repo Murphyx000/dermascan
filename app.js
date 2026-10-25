@@ -181,7 +181,7 @@ async function tapAt(clientX, clientY) {
   // escalas relativas a lo que se ve en pantalla, para que el zoom del usuario ayude
   const vis = 1 / view.scale;
   const l = await lesionAt(img, img.width, img.height, nx, ny, segProb, detSession && lesionProb, cfg.det_threshold,
-                           { keepAll: true, retryLow: true, scales: [0.15, 0.3, 0.6].map((f) => f * vis) });
+                           { keepAll: true, retryLow: true, scales: [0.08, 0.15, 0.3, 0.6].map((f) => f * vis) });
   if (run !== findRun) return;
   if (!l) {
     renderCandList();
@@ -409,6 +409,8 @@ function fail(e) {
 $("inCamera").addEventListener("change", onFile);
 $("inGallery").addEventListener("change", onFile);
 document.querySelector(".inAlt").addEventListener("change", onFile);
+// cámara del sistema desde la vista en vivo: en iPhone enfoca de cerca (cambia sola a la lente macro), Safari no
+$("inNative").addEventListener("change", (e) => { if (e.target.files[0]) stopCamera(); onFile(e); });
 $("btnBack").addEventListener("click", () => show("vHome"));
 $("btnAnalyze").addEventListener("click", analyze);
 $("btnNew").addEventListener("click", () => show("vHome"));
@@ -493,13 +495,13 @@ function loop() {
       if (!liveBusy && ++liveTick % 2 === 0) {
         liveBusy = true;
         const vw = v.videoWidth, vh = v.videoHeight, x0 = (vw - s) / 2, y0 = (vh - s) / 2;
-        lesionAt(v, vw, vh, 0.5, 0.5, segProb, detSession && lesionProb, cfg.det_threshold, { keepAll: true, retryLow: true, scales: [1, 0.55] })
+        lesionAt(v, vw, vh, 0.5, 0.5, segProb, detSession && lesionProb, cfg.det_threshold, { keepAll: true, retryLow: true, scales: [0.55, 0.3, 0.15] })
           .then((l) => {
             if (!l) { liveSeg = { reason: "none" }; return; }
             const ext = Math.max(l.w * vw, l.h * vh) / s, dc = Math.hypot((l.cx * vw - vw / 2) / s, (l.cy * vh - vh / 2) / s);
             liveSeg = { contour: l.contour.map(([x, y]) => [(x * vw - x0) / s, (y * vh - y0) / s]),
                         reason: l.p != null && l.p < cfg.det_threshold * 0.5 ? "none" : dc > 0.25 ? "off_center"
-                          : ext < 0.06 ? "small" : ext > 0.8 ? "big" : "ok" };
+                          : ext < 0.035 ? "small" : ext > 0.8 ? "big" : "ok" };
           })
           .catch(() => {}).finally(() => { liveBusy = false; });
       }

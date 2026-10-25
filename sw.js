@@ -1,5 +1,5 @@
 // Cache offline: tras la primera visita la app funciona sin conexión.
-const CACHE = "dermascan-v5";
+const CACHE = "dermascan-v6";
 const FILES = [
   "./", "index.html", "style.css", "app.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png",
   "vendor/ort.min.js", "vendor/ort-wasm-simd-threaded.wasm", "vendor/ort-wasm-simd-threaded.mjs", "vendor/qrcode.min.js", "detect.js",
